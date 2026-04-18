@@ -11,7 +11,7 @@ Full context: [Part 1 — Reading NVIDIA SASS from First Principles](https://flo
 ### Phase 1 — Teaching kernels on SM120 (controlled variation)
 
 - [x] **Part 1** — Kernels 01–04: baseline, FMA fusion, scoreboards, unroll cascade. [Read](https://florianmattana.com/posts/sass_king/)
-- [ ] Kernel 05 — Loop with small fixed trip count
+- [x] Kernel 05 — Loop with small fixed trip count
 - [ ] Kernel 06 — Shared memory scalar (`LDS`, `STS`, `BAR.SYNC`)
 - [ ] Kernel 07 — Vectorized load (`LDG.E.128`)
 - [ ] Kernel 08 — Warp-level reduction (`SHFL.BFLY`)
