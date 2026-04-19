@@ -333,6 +333,124 @@ Chapter focused on vectorized LDG/STG instructions. Seven variants tested to map
 
 ---
 
+## Kernel 09 warp shuffle and vote (warp-level communication primitives)
+
+Chapter focused on warp-synchronous communication primitives. Twelve variants tested covering SHFL family, VOTE family, MATCH family, synchronization helpers, and edge cases (64-bit operands, partial masks, divergent predecessors).
+
+### Observations (general)
+
+* [OBS] SM120 has four distinct SHFL opcodes: SHFL.IDX, SHFL.BFLY, SHFL.UP, SHFL.DOWN. Each maps to one CUDA intrinsic.
+* [OBS] SHFL format: `SHFL.{variant} Pdst, Rdst, Rsrc, mask_or_lane, segment_mask`. The segment mask is `0x1f` for IDX, BFLY, DOWN, but `RZ` for UP.
+* [OBS] VOTE has two forms: predicate output (`VOTE.ANY Pdst, Psrc`) for `__any_sync` and `__all_sync`, register output (`VOTE.ANY Rdst, PT, Psrc`) for `__ballot_sync`.
+* [OBS] MATCH has two opcodes: MATCH.ANY and MATCH.ALL. MATCH.ALL produces both a predicate and a register in a single instruction, the only such observed dual-output opcode so far.
+* [OBS] `BSSY.RECONVERGENT` and `BSYNC.RECONVERGENT` wrap SHFL only when the SHFL is preceded by divergent code. No divergence means no reconvergence wrapper.
+* [OBS] `__syncwarp()` has no dedicated SASS opcode on SM120. ptxas emits NOP padding when it must stall (first call before an unready SHFL) or eliminates it entirely (redundant calls).
+* [OBS] `__syncwarp(partial_mask)` causes ptxas to emit a `MOV` of the mask into an unused register plus a single NOP. The mask does not affect the subsequent SHFL segment encoding.
+* [OBS] `__activemask()` is the idiom `VOTE.ANY Rdst, PT, PT` (ballot with always-true predicate).
+* [OBS] 64-bit SHFL is two consecutive 32-bit SHFL instructions, one per half. No SHFL.64 variant.
+* [OBS] Division by 32 (for warp_id computation) compiles to `SHF.R.U32.HI R, RZ, 0x5, R`. Consistent with the power-of-2 division rule from kernel 06.
+* [OBS] New SASS variant observed: `IMAD.WIDE.U32`. Used when ptxas can prove the index is non-negative (e.g., warp_id derived from tid/32).
+* [OBS] `LOP3.LUT P, ..., 0xc0, !PT` fuses `x AND mask` with compare-to-zero, producing a predicate directly. Pattern repeated across most variants for the `(tid & 31) == 0` lane-zero test.
+* [OBS] Initialization of `float val = 0.0f` before a possibly-divergent LDG uses `HFMA2 R, -RZ, RZ, 0, 0` (FP16 packed FMA trick, same as kernels 04 and 05 for arbitrary FP32 constants).
+
+### Variant 09a (SHFL.BFLY with bounds check)
+
+* [OBS] First observation of `BSSY.RECONVERGENT B0, 0xf0` and `BSYNC.RECONVERGENT B0` wrapping a divergent LDG. The SHFL sequence that follows requires all threads active.
+* [OBS] 5 SHFL.BFLY + 5 FADD for a 32-thread butterfly reduction. Classic pattern.
+* [OBS] HFMA2 used to initialize R2 = 0.0f before the divergent LDG, so out-of-bounds threads participate in SHFL with a defined value.
+
+### Variant 09b (SHFL.BFLY without bounds check)
+
+* [RES] BSSY/BSYNC.RECONVERGENT appears only when SHFL is preceded by divergent code. **Confirmed** by removal of the bounds check.
+* [OBS] 21 useful instructions, down from 30 in 09a.
+
+### Variant 09c (SHFL.IDX broadcast)
+
+* [OBS] `SHFL.IDX PT, R9, R2, RZ, 0x1f`. Format: 4th operand is the source lane (RZ = lane 0), 5th operand is segment mask.
+
+### Variant 09d (VOTE via `__ballot_sync`)
+
+* [OBS] `FSETP.GT.AND P0, PT, R2, RZ, PT` then `VOTE.ANY R5, PT, P0`. Predicate input, register output (mask).
+
+### Variant 09e (`__syncwarp()` full mask)
+
+* [OBS] First `__syncwarp()` before a SHFL: 6 NOPs inserted. Subsequent `__syncwarp()` calls: eliminated completely.
+* [OBS] `__syncwarp()` prevents ptxas from interleaving useful instructions between LDG and SHFL. The 6 NOPs replace what would otherwise be a LOP3 or similar filler.
+
+### Variant 09f (SHFL.UP)
+
+* [OBS] `SHFL.UP PT, R9, R2, 0x4, RZ`. 5th operand is `RZ`, not `0x1f` as in other SHFL variants.
+* [HYP] The different encoding likely relates to UP's out-of-range semantics (lane N-delta does not exist for small N, so the lane keeps its original value). Requires a distinct mode bit.
+
+### Variant 09g (SHFL.DOWN)
+
+* [OBS] `SHFL.DOWN PT, R9, R2, 0x4, 0x1f`. Format matches BFLY and IDX, not UP.
+
+### Variant 09h (VOTE.ALL vs VOTE.ANY)
+
+* [RES] VOTE.ANY and VOTE.ALL are **two distinct SASS opcodes**, not the same opcode with a mode flag. Confirmed by side-by-side emission in the same kernel.
+* [OBS] Both use predicate output form when invoked via `__any_sync` or `__all_sync`.
+
+### Variant 09i (REDUX, moved to chapter 10)
+
+* [OBS] Quick observation: `REDUX.SUM.S32 UR7, R2` replaces the entire 5 × SHFL.BFLY + 5 × FADD sequence of 09a with a single instruction. Details covered in chapter 10.
+
+### Variant 09j (MATCH.ANY and MATCH.ALL)
+
+* [OBS] `MATCH.ANY R0, R2` produces a register (mask of lanes with same value as mine).
+* [OBS] `MATCH.ALL PT, R5, R2` produces a predicate (all lanes match) AND a register (the mask), in a single instruction.
+* [OBS] First dual-output instruction (simultaneous predicate + register) in our SASS vocabulary.
+
+### Variant 09k (`__syncwarp(partial_mask)`)
+
+* [OBS] ptxas emitted `MOV R11, 0xffff` for the mask, but R11 is never read afterwards. Possibly dead code or a scheduler hint.
+* [OBS] No `WARPSYNC` opcode was generated despite a partial mask. The SHFL still used segment mask `0x1f` (full warp).
+* [HYP] On SM120, `__syncwarp` mask is effectively ignored at the SASS level. The intrinsic is a vestige of the Volta Independent Thread Scheduling transition requiring explicit participation declaration. To verify with deliberately divergent kernels.
+
+### Variant 09l (`__activemask()`)
+
+* [OBS] Compiles to exactly one instruction: `VOTE.ANY R5, PT, PT`. Ballot with always-true predicate returns the mask of active lanes.
+* [OBS] No dedicated `ACTIVEMASK` opcode exists.
+
+### Variant 09m (SHFL on 64-bit)
+
+* [OBS] `__shfl_sync` on a `double` compiles to 2 × SHFL.IDX, one per 32-bit half.
+* [OBS] The two SHFL are emitted in high-half-first order. Reason unclear (hypothesis: ptxas orders by encoding constraints or dependency distance).
+
+### Resolved hypotheses
+
+* [RES] BSSY/BSYNC.RECONVERGENT is conditional on preceding divergence. **Confirmed** (09b).
+* [RES] VOTE.ALL exists as distinct opcode from VOTE.ANY. **Confirmed** (09h).
+* [RES] `__syncwarp` has no dedicated SASS opcode. **Confirmed** (09e, 09k).
+* [RES] MATCH.ALL produces simultaneous predicate + register output. **Confirmed** (09j).
+
+### Open hypotheses
+
+* [HYP] Semantic difference between SHFL.UP's `RZ` and other SHFL variants' `0x1f` in the 5th operand. Encoding-only, or sem difference in out-of-range behavior?
+* [HYP] The MOV of partial mask in 09k: dead code or scheduler hint?
+* [HYP] Pipeline assignment for SHFL (documentation says LSU but not confirmed by gpuasm).
+* [HYP] Behavior of SHFL under genuine divergence (half-warp taking different paths). Not tested.
+* [HYP] Does `WARPSYNC` opcode exist at all on SM120, or is it fully replaced by NOP padding for all mask variants?
+
+### New instructions observed in this chapter
+
+| Opcode | Usage |
+|---|---|
+| SHFL.BFLY | Butterfly shuffle (XOR pattern) |
+| SHFL.IDX | Broadcast from specified lane |
+| SHFL.UP | Lane N reads lane N-delta |
+| SHFL.DOWN | Lane N reads lane N+delta |
+| VOTE.ANY (predicate) | Predicate OR across warp |
+| VOTE.ALL (predicate) | Predicate AND across warp |
+| VOTE.ANY (register) | Ballot (active-thread mask with predicate filter) |
+| MATCH.ANY | Register: mask of lanes with matching value |
+| MATCH.ALL | Predicate + Register: all lanes match + mask |
+| BSSY.RECONVERGENT | Declare reconvergence scope |
+| BSYNC.RECONVERGENT | Close reconvergence scope |
+| IMAD.WIDE.U32 | Unsigned-explicit 64-bit multiply-add |
+
+---
+
 ## Cross chapter summary
 
 ### Pipelines observed so far
@@ -340,32 +458,194 @@ Chapter focused on vectorized LDG/STG instructions. Seven variants tested to map
 | Pipeline | Instructions observed |
 |---|---|
 | FMA | FFMA, FADD, FMUL, IMAD, HFMA2 |
-| ALU | ISETP, FSETP, MOV, LEA, LOP3, FSEL, SHF |
-| LSU | LDG, LDG.E.64, LDG.E.128, LDG.E.ENL2.256, STG, STG.E.64, STG.E.128, STG.E.ENL2.256, LDS, STS |
+| ALU | ISETP, FSETP, MOV, LEA, LOP3, FSEL, SHF, SEL |
+| LSU | LDG, LDG.E.64, LDG.E.128, LDG.E.ENL2.256, STG, STG.E.64, STG.E.128, STG.E.ENL2.256, LDS, STS, SHFL.BFLY, SHFL.IDX, SHFL.UP, SHFL.DOWN, MATCH.ANY, MATCH.ALL |
 | ADU | LDC, S2R, BAR.SYNC |
 | DCC | LDCU |
 | UNIFORM | S2UR, UMOV, ULEA, UIADD3, UISETP, UPLOP3, ULOP3 |
 | XU | MUFU.RCP, I2F, F2I (first observed in kernel 06 modulo helper) |
-| CBU | EXIT, BRA, CALL, RET |
+| CBU | EXIT, BRA, CALL, RET, BSSY, BSYNC |
 | FP64 | DADD (first observed in kernel 08f) |
+| VOTE | VOTE.ANY, VOTE.ALL |
 
-### Cross cutting observations
+### Architectural invariants
 
-* [OBS] Every SASS instruction is 128 bits (16 bytes), fixed size since Volta.
-* [OBS] Stall count field is 4 bits (values 0 to 15). Stall=15 repeated on consecutive instructions signals an ILP shortage or pipeline saturation.
-* [OBS] Yield flag is set on every instruction with a scoreboard wait.
-* [OBS] Predication used by ptxas for short conditional blocks, BRA for longer blocks. Predication evaluates every instruction in the block even when masked off, branches let the warp skip entirely when uniform.
-* [OBS] NOP padding at the end of every kernel aligns total size to a memory boundary (typically 128 or 512 bytes). Never executed.
+Rules that hold across every SM120 dump we have examined. These are reliable enough to use as sanity checks when reading an unfamiliar dump.
+
+* Every SASS instruction is 128 bits (16 bytes): 64 bits opcode + 64 bits control code. Fixed since Volta.
+* Stall count field in the control code is 4 bits (values 0 to 15). Stall=15 repeated on consecutive instructions signals an ILP shortage or pipeline saturation.
+* Six scoreboards per warp (SB0 to SB5). Hard budget.
+* Yield flag is set on every instruction with a scoreboard wait. Tells the scheduler it can switch to another warp during the wait.
+* Fixed-latency operations (FFMA, IMAD, ISETP, FADD, FMUL) use only stall count, no scoreboard.
+* Variable-latency operations (LDG, LDS, LDC, S2R, MUFU, BAR, SHFL, MATCH, VOTE) use scoreboards.
+* Per-thread register file R0-R255 and uniform register file UR0-UR63 (UR0-UR255 on SM100+) are physically separate with distinct datapaths.
+* ptxas classifies values as uniform or per-thread automatically. Uniformity means "identical across all 32 threads of the warp".
+* NOP padding at the end of every kernel aligns total size to a memory boundary (typically 128 or 512 bytes). Never executed.
+* ptxas emits a BRA-to-self after the final EXIT as a safety trap. Never reached by a correct control path.
+
+### Canonical prologue (every kernel)
+
+Every CUDA kernel on SM120 starts with the same 8-instruction skeleton:
+
+```
+LDC R1, c[0x0][0x37c]                  // stack pointer init (ABI)
+S2R R_tid, SR_TID.X                    // threadIdx.x
+S2UR UR_ctaid, SR_CTAID.X              // blockIdx.x (uniform)
+LDCU UR_n, c[0x0][0x...]               // kernel scalar arg (n)
+LDC R_bdim, c[0x0][0x360]              // blockDim.x
+IMAD R_i, R_bdim, UR_ctaid, R_tid      // i = blockDim.x * blockIdx.x + threadIdx.x
+ISETP.GE.AND P0, PT, R_i, UR_n, PT     // P0 = (i >= n)
+@P0 EXIT                                // out-of-bounds threads exit
+```
+
+Pattern-matched by:
+* Stack pointer init at c[0x0][0x37c].
+* blockDim.x at c[0x0][0x360].
+* Kernel arguments starting at c[0x0][0x380] (first), 0x388 (second), and so on.
+* Kernel scalar arguments (like n) at c[0x0][0x3a0] or similar.
+* The global memory descriptor at c[0x0][0x358].
+
+The ISETP that feeds `@P0 EXIT` consistently has stall=13 across all dumps. Hypothesis (unresolved): cross-pipeline transfer from ALU to CBU.
+
+### Canonical bounds check
+
+Two-instruction pattern:
+
+```
+ISETP.GE.AND P0, PT, R_i, UR_n, PT     // stall=13
+@P0 EXIT
+```
+
+Always predication, never BRA-around. Reason: predication requires no reconvergence slot, so divergence cost is zero for out-of-bounds exit.
+
+### Canonical lane-zero test (per-warp output)
+
+Used in every reduction or warp-wide operation kernel:
+
+```
+LOP3.LUT P0, RZ, R_tid, 0x1f, RZ, 0xc0, !PT
+@P0 EXIT
+```
+
+Single instruction computes `(tid AND 0x1f) == 0` and produces the predicate directly. Fuses AND with compare-to-zero. The LUT value `0xc0` with the `!PT` input encodes the fusion.
+
+### Canonical warp-id derivation
+
+Division by 32 for `warp_id = threadIdx.x / 32` is always a right shift, never a modulo CALL:
+
+```
+SHF.R.U32.HI R_warp, RZ, 0x5, R_tid
+```
+
+More generally: division by 2^k is `SHF.R.U32.HI R, RZ, k, R`, multiplication by 2^k is `SHF.L.U32 R, R, k, RZ`. Applies to any power-of-2 constant.
+
+### Canonical pointer-and-address pattern
+
+For a kernel argument that is a pointer:
+
+```
+LDC.64 R_ptr, c[0x0][0x3??]            // pointer from constant memory
+IMAD.WIDE R_addr, R_i, sizeof(T), R_ptr  // &arr[i]
+LDG.E R_val, desc[UR_desc][R_addr.64]  // load
+```
+
+The IMAD.WIDE immediate is always sizeof(T) in bytes. The LDG uses descriptor-based addressing with the descriptor loaded via LDCU.64 from c[0x0][0x358] once per kernel.
+
+### Canonical kernel epilogue
+
+```
+STG.E desc[UR_desc][R_addr.64], R_val   // store (fire and forget, no SB)
+EXIT
+BRA . (self)                             // safety trap, never executed
+NOP
+NOP
+...                                      // padding to 128 or 512 byte alignment
+```
+
+### Canonical FP constant materialization
+
+Any non-trivial FP32 constant used as an FFMA multiplier is loaded via HFMA2:
+
+```
+HFMA2 R, -RZ, RZ, FP16_high, FP16_low
+```
+
+The bit pattern of R becomes `FP16_high | FP16_low`, interpreted as FP32. Rule: FFMA has one immediate slot (src3, the addend). Multiplier sources must be registers. HFMA2 is the systematic materialization idiom.
+
+Exception: the addend of an FFMA can be an immediate directly (e.g., `FFMA R, R, R, 0.5`).
+
+### Canonical warp reduction (butterfly)
+
+```
+SHFL.BFLY PT, R_tmp, R_val, 0x10, 0x1f ; FADD R_val, R_val, R_tmp
+SHFL.BFLY PT, R_tmp, R_val, 0x08, 0x1f ; FADD R_val, R_val, R_tmp
+SHFL.BFLY PT, R_tmp, R_val, 0x04, 0x1f ; FADD R_val, R_val, R_tmp
+SHFL.BFLY PT, R_tmp, R_val, 0x02, 0x1f ; FADD R_val, R_val, R_tmp
+SHFL.BFLY PT, R_tmp, R_val, 0x01, 0x1f ; FADD R_val, R_val, R_tmp
+```
+
+5 stages for a 32-lane warp. If the source has divergent code before the reduction, ptxas wraps the whole thing in BSSY.RECONVERGENT / BSYNC.RECONVERGENT.
+
+For int32 only, a single `REDUX.SUM.S32 UR, R` replaces all 10 instructions.
+
+### Canonical shared memory access
+
+```
+S2UR UR_cga, SR_CgaCtaId
+UMOV UR_base, 0x400
+ULEA UR_base, UR_cga, UR_base, 0x18     // per-block shared base
+LEA R_addr, R_tid, UR_base, 0x2         // &smem[tid]
+STS [R_addr], R_val
+BAR.SYNC.DEFER_BLOCKING 0x0             // __syncthreads()
+LDS R_val, [R_addr]
+```
+
+The `UMOV UR, 0x400` + `ULEA ..., 0x18` pair appears if and only if the kernel uses `__shared__` memory. The `0x18 = 24` in ULEA is a shift amount, producing a per-block offset within the SM-wide shared pool.
+
+### Arithmetic operator compilation rules
+
+| Source | ptxas strategy |
+|---|---|
+| `%` by runtime variable | CALL `__cuda_sm20_rem_u16` (expensive) |
+| `%` by non-power-of-2 constant | Inline reciprocal multiplication with magic number |
+| `%` by power-of-2 constant | Fused into LEA + LOP3 mask (cheap) |
+| `/` by runtime variable | CALL to division helper |
+| `/` by power-of-2 constant | SHF.R.U32.HI (shift right) |
+| `*` by power-of-2 constant | SHF.L.U32 (shift left) |
+| `+`, `*+` in FP | FFMA when `a*b+c` pattern present, else separate FMUL / FADD |
+| FP constant as multiplier | HFMA2 materialization into register |
+| FP constant as addend | Immediate in FFMA src3 slot |
+
+### Scheduling patterns
+
+ptxas systematically places independent instructions between a producer and its consumer to hide latency. Observed patterns:
+
+* **IMAD.WIDE interleaved with LDG.** Address computations are placed between consecutive LDG emissions so that multiple loads are in flight simultaneously.
+* **Pointer address of the store placed early.** When the value is the bottleneck, the store address is computed while the value is still being produced.
+* **Pointer address of the store placed late.** When the value chain is long (many sequential FFMAs), the store address is deferred to minimize register live range.
+* **Constant materialization (HFMA2) placed at the pipeline choice point.** HFMA2 is used in compute-heavy blocks where the FMA pipeline is loaded, MOV is used otherwise.
+* **VOTE.ANY hoisted to kernel start** when its input is `PT` (as in `__activemask()`). No data dependency, so it can run in parallel with pointer loads.
+* **Counter update interleaved with compute in unrolled loops.** UIADD3 and UISETP for loop control are placed between FFMAs, not at the tail.
+
+### Compiler artifacts to watch for
+
+* **STL / LDL** (not yet observed in our kernels) would indicate register spilling. Signal of a kernel too wide for the register file.
+* **CALL** indicates an out-of-line function: division/modulo slowpath, transcendental math, non-inlined helper.
+* **Kernel size significantly larger than expected** often means cascade unrolling (runtime trip count).
+* **BSSY / BSYNC.RECONVERGENT** wrapping a short section means ptxas detected divergence before a warp-synchronous operation.
+* **Consecutive NOPs between arithmetic instructions** mean the pipeline cannot keep up (FP64 on consumer parts, or ILP shortage).
 
 ### Global diagnostic workflow
 
 When opening any SASS dump for performance work:
 
-1. Skip the prologue by pattern matching the 6 section skeleton.
-2. Find the hot region (BRA backward for a loop body, or the main compute block).
-3. Count the useful compute ratio (FFMA + FADD + FMUL + MMA divided by total body instructions).
-4. Grep for artifact signals: STL/LDL (spill), CALL (slowpath), abnormal size (unroll cascade).
-5. Trace scoreboards: which SB is used, who produces, who waits.
-6. Check stall counts. Stall=15 repeated signals a problem.
-7. Verify fusion. Count FFMAs vs separate FMUL+FADD chains.
-8. Correlate with NCU. SASS identifies the "who", NCU quantifies the "how much".
+1. Skip the prologue by pattern matching the 8-instruction skeleton.
+2. Find the bounds check `@P0 EXIT` and the body section that follows.
+3. Locate the hot region (backward BRA for a loop body, or the dense compute block).
+4. Count the useful compute ratio (FFMA + FADD + FMUL + MMA divided by total body instructions).
+5. Grep for artifact signals: STL/LDL (spill), CALL (slowpath), abnormal size (cascade).
+6. Trace scoreboards: which SB is used, who produces, who waits.
+7. Check stall counts. Stall=15 repeated signals a problem.
+8. Verify fusion. Count FFMAs vs separate FMUL+FADD chains.
+9. Look for NOP padding within the body (FP64 bottleneck).
+10. Correlate with NCU. SASS identifies the "who", NCU quantifies the "how much".
